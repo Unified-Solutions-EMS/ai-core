@@ -320,7 +320,11 @@ class OpenAiClient
         $http = Http::withToken((string) config('ai.openai.api_key'))
             ->acceptJson()
             ->timeout($timeoutSeconds ?? (int) config('ai.openai.timeout', 120))
-            ->connectTimeout((int) config('ai.openai.connect_timeout', 15));
+            ->connectTimeout((int) config('ai.openai.connect_timeout', 15))
+            ->withHeaders(array_filter([
+                'OpenAI-Organization' => (string) config('ai.openai.organization', ''),
+                'OpenAI-Project' => (string) config('ai.openai.project', ''),
+            ], fn (string $value): bool => $value !== ''));
 
         try {
             $response = $call($http);

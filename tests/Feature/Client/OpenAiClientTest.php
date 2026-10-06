@@ -65,6 +65,22 @@ class OpenAiClientTest extends TestCase
         Http::assertSent(fn (Request $request): bool => $request->url() === 'https://api.openai.test/v1/chat/completions');
     }
 
+    public function test_organization_and_project_headers_are_sent_only_when_set(): void
+    {
+        OpenAiFake::chat([OpenAiFake::message('a'), OpenAiFake::message('b')]);
+
+        $this->client()->chat([['role' => 'user', 'content' => 'x']]);
+        config()->set('ai.openai.organization', 'org-1');
+        config()->set('ai.openai.project', 'proj-1');
+        $this->client()->chat([['role' => 'user', 'content' => 'x']]);
+
+        $requests = Http::recorded()->map(fn (array $pair): Request => $pair[0])->values();
+        $this->assertFalse($requests[0]->hasHeader('OpenAI-Organization'));
+        $this->assertFalse($requests[0]->hasHeader('OpenAI-Project'));
+        $this->assertTrue($requests[1]->hasHeader('OpenAI-Organization', 'org-1'));
+        $this->assertTrue($requests[1]->hasHeader('OpenAI-Project', 'proj-1'));
+    }
+
     public function test_fails_closed_without_an_api_key(): void
     {
         config()->set('ai.openai.api_key', null);

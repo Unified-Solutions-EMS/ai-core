@@ -34,6 +34,11 @@ return [
     'openai' => [
         'api_key' => env('OPENAI_API_KEY'),
 
+        // Sent as OpenAI-Organization / OpenAI-Project headers when set
+        // (legacy user keys need the project association).
+        'organization' => env('OPENAI_ORGANIZATION'),
+        'project' => env('OPENAI_PROJECT'),
+
         // openai-php style hosts without a scheme ("api.openai.com/v1")
         // are accepted; the client adds https://.
         'base_url' => env('OPENAI_BASE_URL', 'https://api.openai.com/v1'),

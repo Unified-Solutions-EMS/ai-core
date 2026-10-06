@@ -30,6 +30,7 @@ No new environment variables are required. `config/ai.php` reads the names apps 
 |---|---|
 | `ai.openai.api_key` | `OPENAI_API_KEY` (unset = every AI feature off; nothing is sent) |
 | `ai.openai.base_url` | `OPENAI_BASE_URL` (scheme optional) |
+| `ai.openai.organization` / `project` | `OPENAI_ORGANIZATION` / `OPENAI_PROJECT` (sent as headers when set) |
 | `ai.openai.timeout` | `OPENAI_TIMEOUT`, then `OPENAI_REQUEST_TIMEOUT` |
 | `ai.openai.models.chat` / `extraction` / `transcription` / `captions` | `OPENAI_CHAT_MODEL`, `OPENAI_EXTRACTION_MODEL`, `OPENAI_TRANSCRIPTION_MODEL`, `OPENAI_CAPTIONS_MODEL` |
 | `ai.openai.reasoning_effort` | `OPENAI_REASONING_EFFORT` (empty omits it) |
