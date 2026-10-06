@@ -1,0 +1,14 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: pint
+      glob: "*.php"
+      run: vendor/bin/pint {staged_files}
+      stage_fixed: true
+
+pre-push:
+  jobs:
+    - name: phpstan
+      run: vendor/bin/phpstan analyse --memory-limit=2G --no-progress
+    - name: tests
+      run: vendor/bin/phpunit

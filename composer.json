@@ -1,0 +1,56 @@
+{
+    "name": "unified/ai-core",
+    "description": "Shared AI platform for Unified Solutions applications: OpenAI client, agent loop, proposals, run ledger, SOP reader and PHI posture",
+    "type": "library",
+    "license": "proprietary",
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^11.0|^12.0|^13.0",
+        "illuminate/http": "^11.0|^12.0|^13.0",
+        "illuminate/database": "^11.0|^12.0|^13.0",
+        "illuminate/queue": "^11.0|^12.0|^13.0",
+        "illuminate/console": "^11.0|^12.0|^13.0",
+        "guzzlehttp/guzzle": "^7.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0|^11.0",
+        "phpunit/phpunit": "^10.5|^11.0|^12.0",
+        "laravel/pint": "^1.0",
+        "larastan/larastan": "^3.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Unified\\AiCore\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Unified\\AiCore\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "lint": "pint",
+        "lint:test": "pint --test",
+        "analyse": "phpstan analyse --memory-limit=2G",
+        "ci": [
+            "@lint:test",
+            "@analyse",
+            "@test"
+        ]
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Unified\\AiCore\\AiCoreServiceProvider"
+            ],
+            "aliases": {
+                "Sops": "Unified\\AiCore\\Facades\\Sops"
+            }
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}
