@@ -69,6 +69,55 @@ class ProposalServiceTest extends TestCase
         $this->assertNotSame($a->hash(), $c->hash());
     }
 
+    public function test_plan_hash_survives_a_json_storage_round_trip(): void
+    {
+        $plan = new Plan('Réassigner l’unité → M4 / 救护车', [
+            new PlannedChange('crew', 'shift:12', ['hours' => 12.0, 'rate' => 18.5, 'path' => 'a/b'], [
+                'hours' => 12.0,
+                'nested' => ['z' => [3.0, -0.0, 1.25], 'a' => ['y' => 'ü', 'b' => 0.0]],
+                'empty' => [],
+            ], 'covers the gap', PlannedChange::RISK_LOW),
+        ]);
+
+        $reloaded = Plan::fromArray(json_decode((string) json_encode($plan->toArray()), true));
+        $reordered = Plan::fromArray(['changes' => [[
+            'risk' => 'low',
+            'why' => 'covers the gap',
+            'after' => ['empty' => [], 'nested' => ['a' => ['b' => 0, 'y' => 'ü'], 'z' => [3, 0, 1.25]], 'hours' => 12],
+            'before' => ['path' => 'a/b', 'rate' => 18.5, 'hours' => 12],
+            'entity' => 'shift:12',
+            'target' => 'crew',
+        ]], 'summary' => 'Réassigner l’unité → M4 / 救护车']);
+
+        $this->assertSame($plan->hash(), $reloaded->hash());
+        $this->assertSame($plan->hash(), $reordered->hash());
+        $this->assertNotSame($plan->hash(), Plan::fromArray(['summary' => $plan->summary, 'changes' => [
+            ['target' => 'crew', 'entity' => 'shift:12', 'before' => ['hours' => 12.0, 'rate' => 18.5, 'path' => 'a/b'], 'after' => ['hours' => 12.5], 'why' => 'covers the gap', 'risk' => 'low'],
+        ]])->hash());
+    }
+
+    public function test_approve_then_execute_after_a_storage_round_trip(): void
+    {
+        $plan = new Plan('Extend shift', [
+            new PlannedChange('crew', 'shift:12', ['hours' => 8.0], ['hours' => 12.0, 'note' => 'café'], 'coverage', PlannedChange::RISK_LOW),
+        ]);
+        $drafted = $this->service()->draft('cad.dispatch', $plan, 7, 3);
+        $shownHash = $plan->hash();
+
+        $proposal = Proposal::query()->find($drafted->id);
+        $this->service()->approve($proposal, 4, 'Approve and apply', $shownHash);
+
+        $applied = [];
+        $this->service()->execute(Proposal::query()->find($drafted->id), function (PlannedChange $change) use (&$applied): string {
+            $applied[] = $change->after;
+
+            return 'ok';
+        });
+
+        $this->assertSame(ProposalStatus::Executed, $proposal->fresh()->status);
+        $this->assertEquals([['hours' => 12, 'note' => 'café']], $applied);
+    }
+
     public function test_refine_replaces_the_plan_and_clears_an_approval(): void
     {
         $proposal = $this->service()->draft('cad.dispatch', $this->plan(), 7, 3);

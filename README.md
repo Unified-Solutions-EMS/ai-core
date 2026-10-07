@@ -70,7 +70,7 @@ $service->execute($proposal, fn (PlannedChange $change, int $i, Proposal $p) => 
 $service->verify($proposal, $userId);
 ```
 
-A refined plan clears the approval. Execution re-checks the hash and claims the proposal with a conditional update, so overlapping requests cannot both run it. The package never writes app data: the executor does.
+The plan hash is taken over canonical JSON (keys sorted at every depth, whole floats written as integers), so a plan hashes the same before and after it is stored and reloaded. A refined plan clears the approval. Execution re-checks the hash and claims the proposal with a conditional update, so overlapping requests cannot both run it. The package never writes app data: the executor does.
 
 ## Run index and SOPs
 
