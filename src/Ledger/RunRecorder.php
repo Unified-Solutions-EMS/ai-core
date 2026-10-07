@@ -84,6 +84,7 @@ class RunRecorder
 
     /**
      * @param  array<string, mixed>|null  $recommendation
+     * @param  string  $summary  built by RunSummary::render()
      */
     public function finish(
         Run $run,
@@ -109,14 +110,14 @@ class RunRecorder
         return $run;
     }
 
-    public function fail(Run $run, Throwable $error, int $promptTokens, int $completionTokens): Run
+    public function fail(Run $run, Throwable $error, int $promptTokens, int $completionTokens, ?string $summary = null): Run
     {
         $run->forceFill([
             'status' => $run->status === RunStatus::Replay ? RunStatus::Replay : RunStatus::Failed,
             'outcome' => ['error' => $error::class, 'message' => mb_substr($error->getMessage(), 0, 500)],
             'prompt_tokens' => $promptTokens,
             'completion_tokens' => $completionTokens,
-            'summary' => 'Did not finish',
+            'summary' => $summary,
         ])->save();
 
         unset($this->sequence[$run->id]);
@@ -166,7 +167,7 @@ class RunRecorder
             'run_id' => $run->uuid,
             'company_sso_id' => $run->company_sso_id,
             'sop_version_id' => $run->sop_version_id,
-            'summary' => (string) ($run->summary ?? ''),
+            'summary' => RunSummary::forIndex($run->summary, $run->domain, $run->indexOutcome()),
             'outcome' => $run->indexOutcome(),
             'approved_by_sso_id' => $this->userSsoId($run->approved_by),
             'created_at' => $run->created_at?->toIso8601String(),

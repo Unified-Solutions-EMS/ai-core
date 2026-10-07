@@ -7,6 +7,8 @@ namespace Unified\AiCore\Tests\Feature\Agent;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Http;
+use InvalidArgumentException;
+use LogicException;
 use RuntimeException;
 use Unified\AiCore\Agent\Agent;
 use Unified\AiCore\Agent\AgentContext;
@@ -19,8 +21,11 @@ use Unified\AiCore\Client\AiException;
 use Unified\AiCore\Ledger\Jobs\RegisterRunWithSso;
 use Unified\AiCore\Ledger\Run;
 use Unified\AiCore\Ledger\RunStatus;
+use Unified\AiCore\Proposal\Plan;
+use Unified\AiCore\Proposal\ProposalService;
 use Unified\AiCore\Testing\OpenAiFake;
 use Unified\AiCore\Tests\Fixtures\EchoTool;
+use Unified\AiCore\Tests\Fixtures\SpendTrackingDefinition;
 use Unified\AiCore\Tests\Fixtures\TestContext;
 use Unified\AiCore\Tests\Fixtures\TestDefinition;
 use Unified\AiCore\Tests\TestCase;
@@ -69,7 +74,7 @@ class AgentTest extends TestCase
         $this->assertSame('107', $run->company_sso_id);
         $this->assertSame(3, $run->user_id);
         $this->assertSame('testapp', $run->app_slug);
-        $this->assertSame(['input' => 'Who goes?'], $run->input_snapshot);
+        $this->assertSame(['input' => 'Who goes?', 'writes' => 'planned', 'refines_proposal' => null], $run->input_snapshot);
         $this->assertSame('Medic 4.', $run->explanation);
         $this->assertSame(36, $run->totalTokens());
         $this->assertSame(64, strlen((string) $run->prompt_hash));
@@ -77,7 +82,7 @@ class AgentTest extends TestCase
 
         Bus::assertDispatched(RegisterRunWithSso::class, fn (RegisterRunWithSso $job): bool => $job->payload['run_id'] === $run->uuid
             && $job->payload['outcome'] === 'completed'
-            && $job->payload['summary'] === 'Answered'
+            && $job->payload['summary'] === 'Test dispatch: 0 proposed changes, completed'
             && $job->payload['company_sso_id'] === '107');
     }
 
@@ -168,10 +173,56 @@ class AgentTest extends TestCase
     public function test_definition_can_supply_its_own_spend(): void
     {
         config()->set('ai.token_caps', ['default' => 50]);
-        $definition = new TestDefinition;
+        $definition = new SpendTrackingDefinition;
+        $definition->records = false;
         $definition->spent = 50;
+        Http::fake();
 
         $this->assertSame(AgentOutcome::CAP_REACHED, $this->runAgent($definition)->status);
+        Http::assertNothingSent();
+    }
+
+    public function test_a_cap_without_any_spend_source_refuses_to_run(): void
+    {
+        $definition = new TestDefinition;
+        $definition->records = false;
+        Http::fake();
+
+        try {
+            $this->runAgent($definition);
+            $this->fail('Expected LogicException');
+        } catch (LogicException $e) {
+            $this->assertStringContainsString('TracksTokenSpend', $e->getMessage());
+        }
+
+        Http::assertNothingSent();
+    }
+
+    public function test_a_disabled_ledger_also_needs_a_spend_source(): void
+    {
+        config()->set('ai.ledger.enabled', false);
+
+        $this->expectException(LogicException::class);
+        $this->runAgent(new TestDefinition);
+    }
+
+    public function test_no_spend_source_is_needed_when_the_cap_is_off(): void
+    {
+        config()->set('ai.token_caps', ['default' => 0]);
+        $definition = new TestDefinition;
+        $definition->records = false;
+        OpenAiFake::chat([OpenAiFake::message('ok')]);
+
+        $this->assertTrue($this->runAgent($definition)->answered());
+    }
+
+    public function test_replays_do_not_count_against_the_daily_cap(): void
+    {
+        config()->set('ai.token_caps', ['default' => 100]);
+        Run::query()->create(['domain' => 'test.dispatch', 'company_id' => 7, 'status' => 'replay', 'prompt_tokens' => 5000]);
+        OpenAiFake::chat([OpenAiFake::message('ok')]);
+
+        $this->assertTrue($this->runAgent(new TestDefinition)->answered());
     }
 
     public function test_unconfigured_client_reports_unavailable_without_recording_anything(): void
@@ -236,27 +287,112 @@ class AgentTest extends TestCase
 
         $run = Run::query()->sole();
         $this->assertSame('trip:12', $run->recommendation['changes'][0]['entity']);
-        $this->assertSame('Proposed 1 change', $run->summary);
+        $this->assertSame('Test dispatch: 1 proposed changes', $run->summary);
+        $this->assertSame('planned', $run->input_snapshot['writes']);
 
         $plan = $outcome->plan('Dispatch plan');
         $this->assertSame('Dispatch plan', $plan->summary);
         $this->assertCount(1, $plan->changes);
     }
 
-    public function test_write_tools_execute_outside_plan_mode(): void
+    public function test_write_tools_are_intercepted_by_default_without_plan_mode(): void
     {
         $definition = new TestDefinition;
         OpenAiFake::chat([OpenAiFake::toolCalls(['c1' => ['assign_unit', ['trip' => 1, 'unit' => 'M1']]]), OpenAiFake::message('done')]);
 
         $outcome = $this->runAgent($definition);
 
+        $this->assertSame(0, $definition->assign->executed);
+        $this->assertCount(1, $outcome->plannedChanges);
+    }
+
+    public function test_write_tools_execute_only_when_the_definition_opts_in(): void
+    {
+        $definition = new TestDefinition;
+        $definition->directWrites = true;
+        OpenAiFake::chat([OpenAiFake::toolCalls(['c1' => ['assign_unit', ['trip' => 1, 'unit' => 'M1']]]), OpenAiFake::message('done')]);
+
+        $outcome = $this->runAgent($definition);
+
         $this->assertSame(1, $definition->assign->executed);
         $this->assertSame([], $outcome->plannedChanges);
+        $this->assertSame('direct', Run::query()->sole()->input_snapshot['writes']);
+    }
+
+    public function test_plan_mode_overrides_an_opt_in_to_direct_writes(): void
+    {
+        $definition = new TestDefinition;
+        $definition->directWrites = true;
+        OpenAiFake::chat([OpenAiFake::toolCalls(['c1' => ['assign_unit', ['trip' => 1, 'unit' => 'M1']]]), OpenAiFake::message('done')]);
+
+        $this->runAgent($definition, planMode: true);
+
+        $this->assertSame(0, $definition->assign->executed);
+    }
+
+    public function test_direct_writes_are_refused_on_a_proposal(): void
+    {
+        $definition = new TestDefinition;
+        $definition->directWrites = true;
+        $proposal = app(ProposalService::class)->draft('test.dispatch', new Plan('p', []), 7, 3);
+        Http::fake();
+
+        $this->expectException(LogicException::class);
+        app(Agent::class)->run($definition, new TestContext, 'refine', proposal: $proposal);
+    }
+
+    public function test_a_run_refining_a_proposal_records_it(): void
+    {
+        $proposal = app(ProposalService::class)->draft('test.dispatch', new Plan('p', []), 7, 3);
+        OpenAiFake::chat([OpenAiFake::message('ok')]);
+
+        app(Agent::class)->run(new TestDefinition, new TestContext, 'refine', proposal: $proposal);
+
+        $this->assertSame($proposal->uuid, Run::query()->sole()->input_snapshot['refines_proposal']);
+    }
+
+    public function test_a_direct_write_run_cannot_become_a_proposal(): void
+    {
+        $definition = new TestDefinition;
+        $definition->directWrites = true;
+        OpenAiFake::chat([OpenAiFake::message('ok')]);
+        $outcome = $this->runAgent($definition);
+
+        $this->expectException(LogicException::class);
+        app(ProposalService::class)->draft('test.dispatch', new Plan('p', []), 7, 3, $outcome->run);
+    }
+
+    public function test_run_summary_is_built_from_the_template_and_counts(): void
+    {
+        $definition = new TestDefinition;
+        $definition->template = '{trips} trips, {assigned} assigned, {unassignable} unassignable';
+        $definition->counts = ['trips' => 3, 'assigned' => 3, 'unassignable' => 0];
+        OpenAiFake::chat([OpenAiFake::message('ok')]);
+
+        $this->runAgent($definition);
+
+        $this->assertSame('Test dispatch: 3 trips, 3 assigned, 0 unassignable', Run::query()->sole()->summary);
+        Bus::assertDispatched(RegisterRunWithSso::class, fn (RegisterRunWithSso $job): bool => $job->payload['summary'] === 'Test dispatch: 3 trips, 3 assigned, 0 unassignable, completed');
+    }
+
+    public function test_an_unsafe_summary_template_is_refused_before_anything_is_sent(): void
+    {
+        $definition = new TestDefinition;
+        $definition->template = 'Patient {name} is "John Doe"';
+        Http::fake();
+
+        $this->expectException(InvalidArgumentException::class);
+
+        try {
+            $this->runAgent($definition);
+        } finally {
+            Http::assertNothingSent();
+        }
     }
 
     public function test_definition_can_opt_out_of_the_ledger(): void
     {
-        $definition = new TestDefinition;
+        $definition = new SpendTrackingDefinition;
         $definition->records = false;
         OpenAiFake::chat([OpenAiFake::message('ok')]);
 

@@ -6,6 +6,7 @@ namespace Unified\AiCore\Tests\Fixtures;
 
 use Unified\AiCore\Agent\AgentContext;
 use Unified\AiCore\Agent\AgentDefinition;
+use Unified\AiCore\Agent\AgentOutcome;
 use Unified\AiCore\Agent\Tool;
 
 class TestDefinition extends AgentDefinition
@@ -19,7 +20,12 @@ class TestDefinition extends AgentDefinition
 
     public bool $records = true;
 
-    public ?int $spent = null;
+    public bool $directWrites = false;
+
+    public ?string $template = null;
+
+    /** @var array<string, int>|null */
+    public ?array $counts = null;
 
     public function __construct(
         public EchoTool $echo = new EchoTool,
@@ -58,9 +64,24 @@ class TestDefinition extends AgentDefinition
         return $this->records;
     }
 
-    public function tokensSpentToday(AgentContext $context): ?int
+    public function allowDirectWrites(): bool
     {
-        return $this->spent;
+        return $this->directWrites;
+    }
+
+    public function domainLabel(): string
+    {
+        return 'Test dispatch';
+    }
+
+    public function summaryTemplate(): string
+    {
+        return $this->template ?? parent::summaryTemplate();
+    }
+
+    public function summaryCounts(AgentOutcome $outcome): array
+    {
+        return $this->counts ?? parent::summaryCounts($outcome);
     }
 
     public function hardRules(AgentContext $context): array
