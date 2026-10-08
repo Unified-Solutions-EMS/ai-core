@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Unified\AiCore\Replay;
 
+use LogicException;
 use Unified\AiCore\Agent\Agent;
 use Unified\AiCore\Agent\AgentContext;
 use Unified\AiCore\Agent\AgentDefinition;
@@ -33,10 +34,12 @@ trait ReplaysWithAgent
     public function replay(Run $run, string $candidateSopBody): Recommendation
     {
         $definition = $this->replayDefinition();
+        $sopDomain = $definition->sopDomain()
+            ?? throw new LogicException($definition::class.' is not SOP-driven (sopDomain() is null); a replay against a candidate SOP would ignore the candidate.');
 
         $context = new DryRunContext(
             inner: $this->replayContext($run),
-            candidateSop: SopVersion::candidate($definition->sopDomain() ?? $definition->domain(), $candidateSopBody),
+            candidateSop: SopVersion::candidate($sopDomain, $candidateSopBody),
             replayOf: $run,
         );
 

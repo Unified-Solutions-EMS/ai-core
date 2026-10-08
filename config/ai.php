@@ -79,7 +79,7 @@ return [
     'ledger' => [
         'enabled' => (bool) env('AI_LEDGER_ENABLED', true),
 
-        // ai:prune-runs default retention.
+        // ai:prune-runs default retention (runs and finished proposals).
         'retention_days' => (int) env('AI_RUN_RETENTION_DAYS', 365),
 
         // Register finished runs with SSO's run index (PHI-free row).
@@ -87,6 +87,12 @@ return [
 
         'queue_connection' => env('AI_QUEUE_CONNECTION', env('METRICS_QUEUE_CONNECTION')),
         'queue' => env('AI_QUEUE', env('METRICS_QUEUE')),
+    ],
+
+    'proposals' => [
+        // ai:recover-stuck-proposals: an execution claimed longer ago than
+        // this, and never finished, is marked failed.
+        'stuck_after_minutes' => (int) env('AI_PROPOSAL_STUCK_MINUTES', 30),
     ],
 
     'sso' => [

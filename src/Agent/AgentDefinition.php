@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Unified\AiCore\Agent;
 
-use Unified\AiCore\Proposal\PlannedChange;
 use Unified\AiCore\Usage\TokenBudget;
 
 /**
@@ -52,7 +51,10 @@ abstract class AgentDefinition
     }
 
     /**
-     * 0 disables the cap.
+     * 0 disables the cap. A positive cap needs a spend source: the run
+     * ledger (recordsRuns() and ai.ledger.enabled), or the definition
+     * implementing TracksTokenSpend. With neither, the agent refuses to
+     * run rather than run uncapped.
      */
     public function dailyTokenCap(AgentContext $context): int
     {
@@ -60,17 +62,9 @@ abstract class AgentDefinition
     }
 
     /**
-     * Today's spend for the cap. Null uses the run ledger; apps that keep
-     * token counts elsewhere (chat history tables) return their own sum.
-     */
-    public function tokensSpentToday(AgentContext $context): ?int
-    {
-        return null;
-    }
-
-    /**
-     * Whether runs go to ai_runs / ai_run_steps. Conversational agents
-     * that already persist every turn may opt out.
+     * Whether runs go to ai_runs / ai_run_steps (the migrations must be
+     * published). Conversational agents that already persist every turn
+     * may opt out; they then implement TracksTokenSpend to keep a cap.
      */
     public function recordsRuns(): bool
     {
@@ -118,18 +112,42 @@ abstract class AgentDefinition
     }
 
     /**
-     * One PHI-free line for SSO's run index. Never include names,
-     * addresses or free text from the input.
-     *
-     * @param  list<PlannedChange>  $plannedChanges
+     * Let WriteTools run directly instead of being recorded as planned
+     * changes. Off by default: a forgotten flag fails closed. Refused when
+     * the run is attached to a Proposal.
      */
-    public function indexSummary(AgentOutcome $outcome, array $plannedChanges): string
+    public function allowDirectWrites(): bool
     {
-        $count = count($plannedChanges);
+        return false;
+    }
 
-        return $count > 0
-            ? sprintf('Proposed %d %s', $count, $count === 1 ? 'change' : 'changes')
-            : 'Answered';
+    /**
+     * Customer-facing name of the work in SSO's run index, e.g.
+     * "CAD dispatch". Letters, digits, spaces and light punctuation only.
+     */
+    public function domainLabel(): string
+    {
+        return $this->domain();
+    }
+
+    /**
+     * Format string for the run index line: literal words plus
+     * {integer_placeholders} filled from summaryCounts(). Never build it
+     * from input; RunSummary refuses anything but safe characters.
+     */
+    public function summaryTemplate(): string
+    {
+        return '{changes} proposed changes';
+    }
+
+    /**
+     * The integers for summaryTemplate()'s placeholders.
+     *
+     * @return array<string, int>
+     */
+    public function summaryCounts(AgentOutcome $outcome): array
+    {
+        return ['changes' => count($outcome->plannedChanges)];
     }
 
     /**

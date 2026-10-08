@@ -8,6 +8,7 @@ use Illuminate\Support\ServiceProvider;
 use Unified\AiCore\Agent\Agent;
 use Unified\AiCore\Client\OpenAiClient;
 use Unified\AiCore\Console\PruneRunsCommand;
+use Unified\AiCore\Console\RecoverStuckProposalsCommand;
 use Unified\AiCore\Ledger\RunRecorder;
 use Unified\AiCore\Phi\PurgeHooks;
 use Unified\AiCore\Proposal\ProposalService;
@@ -42,7 +43,7 @@ class AiCoreServiceProvider extends ServiceProvider
         ], 'ai-migrations');
 
         if ($this->app->runningInConsole()) {
-            $this->commands([PruneRunsCommand::class]);
+            $this->commands([PruneRunsCommand::class, RecoverStuckProposalsCommand::class]);
         }
     }
 }

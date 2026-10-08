@@ -30,13 +30,18 @@ use Illuminate\Support\Str;
  * @property int|null $approved_by
  * @property Carbon|null $approved_at
  * @property string|null $approval_instruction
+ * @property Carbon|null $executing_at
+ * @property int|null $executing_by
  * @property Carbon|null $executed_at
  * @property array<int, array<string, mixed>>|null $results
+ * @property string|null $failed_reason
  * @property int|null $verified_by
  * @property Carbon|null $verified_at
  * @property int|null $rejected_by
  * @property string|null $rejected_reason
  * @property int|null $run_id
+ * @property Carbon|null $created_at
+ * @property Carbon|null $updated_at
  */
 class Proposal extends Model
 {
@@ -55,8 +60,11 @@ class Proposal extends Model
         'approved_by',
         'approved_at',
         'approval_instruction',
+        'executing_at',
+        'executing_by',
         'executed_at',
         'results',
+        'failed_reason',
         'verified_by',
         'verified_at',
         'rejected_by',
@@ -69,6 +77,7 @@ class Proposal extends Model
         'plan' => 'array',
         'results' => 'array',
         'approved_at' => 'datetime',
+        'executing_at' => 'datetime',
         'executed_at' => 'datetime',
         'verified_at' => 'datetime',
     ];
@@ -83,6 +92,18 @@ class Proposal extends Model
     public function planObject(): Plan
     {
         return Plan::fromArray($this->plan);
+    }
+
+    /**
+     * Claimed for execution longer ago than $minutes and never finished:
+     * the worker most likely died. ai:recover-stuck-proposals moves these
+     * to failed.
+     */
+    public function isStale(int $minutes): bool
+    {
+        return $this->status === ProposalStatus::Executing
+            && $this->executing_at !== null
+            && $this->executing_at->lt(now()->subMinutes($minutes));
     }
 
     public function getRouteKeyName(): string

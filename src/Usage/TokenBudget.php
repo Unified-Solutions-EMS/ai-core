@@ -5,13 +5,16 @@ declare(strict_types=1);
 namespace Unified\AiCore\Usage;
 
 use Unified\AiCore\Ledger\Run;
+use Unified\AiCore\Ledger\RunStatus;
 
 /**
  * Daily token cap per company per domain. Caps come from
  * config('ai.token_caps') keyed by domain (domains contain dots, so the
  * array is read whole rather than through a dotted config path), falling
  * back to 'default'. Spend is summed from the run ledger unless the
- * agent definition supplies its own count.
+ * agent definition implements TracksTokenSpend. Replays (SSO's "test
+ * against this run") are staff work and never count against the
+ * agency's cap.
  */
 class TokenBudget
 {
@@ -29,6 +32,7 @@ class TokenBudget
 
         $query = $model::query()
             ->where('domain', $domain)
+            ->where('status', '!=', RunStatus::Replay->value)
             ->where('created_at', '>=', now()->startOfDay());
 
         $companyId === null ? $query->whereNull('company_id') : $query->where('company_id', $companyId);

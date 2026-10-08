@@ -5,13 +5,16 @@ declare(strict_types=1);
 namespace Unified\AiCore\Agent;
 
 use Illuminate\Support\Facades\Log;
+use LogicException;
 use Throwable;
 use Unified\AiCore\Client\ChatCompletion;
 use Unified\AiCore\Client\OpenAiClient;
 use Unified\AiCore\Ledger\Run;
 use Unified\AiCore\Ledger\RunRecorder;
 use Unified\AiCore\Ledger\RunStatus;
+use Unified\AiCore\Ledger\RunSummary;
 use Unified\AiCore\Proposal\PlannedChange;
+use Unified\AiCore\Proposal\Proposal;
 use Unified\AiCore\Sop\SopClient;
 use Unified\AiCore\Sop\SopFrame;
 use Unified\AiCore\Sop\SopVersion;
@@ -31,8 +34,10 @@ use Unified\AiCore\Usage\TokenBudget;
  *   {type: message, content}
  *   {type: error, message}
  *
- * In plan mode (and always for a DryRunContext) WriteTools are never
- * executed: the call becomes a PlannedChange on the outcome.
+ * WriteTools are never executed by default: the call becomes a
+ * PlannedChange on the outcome. Only a definition that returns true from
+ * allowDirectWrites() runs them, and never in plan mode, in a replay
+ * (DryRunContext) or while refining a Proposal.
  */
 class Agent
 {
@@ -53,12 +58,15 @@ class Agent
         ?ConversationStore $conversation = null,
         ?callable $emit = null,
         bool $planMode = false,
+        ?Proposal $proposal = null,
     ): AgentOutcome {
+        $this->assertRunnable($definition, $context, $proposal);
+
         $emit ??= static function (array $event): void {};
         $conversation ??= new InMemoryConversation;
 
         $dryRun = $context instanceof DryRunContext;
-        $planMode = $planMode || $dryRun;
+        $directWrites = $definition->allowDirectWrites() && ! $planMode && ! $dryRun;
         $toolContext = $context instanceof DryRunContext ? $context->inner : $context;
 
         if (! $this->client->isConfigured()) {
@@ -88,7 +96,7 @@ class Agent
             ? $definition->systemPrompt($toolContext)
             : SopFrame::wrap($definition->systemPrompt($toolContext), $sop, $definition->hardRules($toolContext));
 
-        $run = $this->startRun($definition, $context, $toolContext, $input, $sop, $systemPrompt, $dryRun);
+        $run = $this->startRun($definition, $context, $toolContext, $input, $sop, $systemPrompt, $dryRun, $directWrites, $proposal);
         $this->recordRunStep($run, $userStep);
 
         $messages = [
@@ -137,7 +145,7 @@ class Agent
 
                     $emit(['type' => 'tool_call', 'name' => $call->name, 'label' => $definition->toolLabel($call->name, $args)]);
 
-                    $result = $this->executeTool($definition, $tools[$call->name] ?? null, $call->name, $args, $toolContext, $planMode, $planned);
+                    $result = $this->executeTool($definition, $tools[$call->name] ?? null, $call->name, $args, $toolContext, $directWrites, $planned);
 
                     $toolStep = Step::tool($call->id, $call->name, $args, $result->payload);
                     $conversation->record($toolStep);
@@ -159,7 +167,7 @@ class Agent
             }
         } catch (Throwable $e) {
             if ($run !== null) {
-                $this->recorder->fail($run, $e, $promptTokens, $completionTokens);
+                $this->recorder->fail($run, $e, $promptTokens, $completionTokens, RunSummary::labelOnly($definition->domainLabel()));
             }
 
             throw $e;
@@ -170,7 +178,7 @@ class Agent
         $outcome = new AgentOutcome(AgentOutcome::ITERATION_LIMIT, null, $planned, $promptTokens, $completionTokens, $run, $sop);
 
         if ($run !== null) {
-            $this->recorder->finish($run, RunStatus::Incomplete, null, $this->recommendation($planned, null), $promptTokens, $completionTokens, $definition->indexSummary($outcome, $planned));
+            $this->recorder->finish($run, RunStatus::Incomplete, null, $this->recommendation($planned, null), $promptTokens, $completionTokens, $this->summary($definition, $outcome));
         }
 
         return $outcome;
@@ -202,7 +210,7 @@ class Agent
         $outcome = new AgentOutcome(AgentOutcome::ANSWERED, $content, $planned, $promptTokens, $completionTokens, $run, $sop);
 
         if ($run !== null) {
-            $this->recorder->finish($run, RunStatus::Completed, $content, $this->recommendation($planned, $content), $promptTokens, $completionTokens, $definition->indexSummary($outcome, $planned));
+            $this->recorder->finish($run, RunStatus::Completed, $content, $this->recommendation($planned, $content), $promptTokens, $completionTokens, $this->summary($definition, $outcome));
         }
 
         return $outcome;
@@ -218,7 +226,7 @@ class Agent
         string $name,
         array $args,
         AgentContext $context,
-        bool $planMode,
+        bool $directWrites,
         array &$planned,
     ): ToolResult {
         if ($tool === null) {
@@ -226,7 +234,7 @@ class Agent
         }
 
         try {
-            if ($planMode && $tool instanceof WriteTool) {
+            if ($tool instanceof WriteTool && ! $directWrites) {
                 $change = $tool instanceof DescribesChange
                     ? $tool->describeChange($args, $context)
                     : PlannedChange::fromToolCall(SsoEndpoint::appSlug(), $name, $args);
@@ -291,8 +299,9 @@ class Agent
             return null;
         }
 
-        $spent = $definition->tokensSpentToday($context)
-            ?? ($this->recorder->enabled() ? $this->budget->spentToday($definition->domain(), $context->companyId()) : 0);
+        $spent = $definition instanceof TracksTokenSpend
+            ? $definition->tokensSpentToday($context)
+            : $this->budget->spentToday($definition->domain(), $context->companyId());
 
         return $spent >= $cap ? $cap : null;
     }
@@ -322,12 +331,19 @@ class Agent
         ?SopVersion $sop,
         string $systemPrompt,
         bool $dryRun,
+        bool $directWrites,
+        ?Proposal $proposal,
     ): ?Run {
-        if (! $definition->recordsRuns() || ! $this->recorder->enabled()) {
+        if (! $this->recordsRuns($definition)) {
             return null;
         }
 
-        $snapshot = ['input' => $input, ...$definition->inputSnapshot($toolContext, $input)];
+        $snapshot = [
+            'input' => $input,
+            ...$definition->inputSnapshot($toolContext, $input),
+            'writes' => $directWrites ? 'direct' : 'planned',
+            'refines_proposal' => $proposal?->uuid,
+        ];
 
         if ($context instanceof DryRunContext) {
             $snapshot['replay_of'] = $context->replayOf?->uuid;
@@ -343,6 +359,43 @@ class Agent
             promptHash: hash('sha256', $systemPrompt),
             replay: $dryRun,
         );
+    }
+
+    /**
+     * Configuration problems that must stop a run before anything is sent:
+     * an unenforceable cap, direct writes on a proposal, a replay whose
+     * candidate SOP would be ignored, an unsafe run-index summary format.
+     */
+    public function assertRunnable(AgentDefinition $definition, AgentContext $context, ?Proposal $proposal = null): void
+    {
+        $name = $definition::class;
+
+        if ($definition->dailyTokenCap($context) > 0 && ! $definition instanceof TracksTokenSpend && ! $this->recordsRuns($definition)) {
+            throw new LogicException("{$name} has a daily token cap but records no runs and does not implement TracksTokenSpend, so the cap could not be enforced. Record runs, implement TracksTokenSpend, or set the cap to 0.");
+        }
+
+        if ($proposal !== null && $definition->allowDirectWrites()) {
+            throw new LogicException("{$name} allows direct writes, so it cannot work on a proposal: proposal changes run only through ProposalService after approval.");
+        }
+
+        if ($context instanceof DryRunContext && $context->candidateSop !== null && $definition->sopDomain() === null) {
+            throw new LogicException("{$name} is not SOP-driven (sopDomain() is null), so replaying it against a candidate SOP would ignore the candidate.");
+        }
+
+        if ($this->recordsRuns($definition)) {
+            RunSummary::assertLabel($definition->domainLabel());
+            RunSummary::assertTemplate($definition->summaryTemplate());
+        }
+    }
+
+    private function recordsRuns(AgentDefinition $definition): bool
+    {
+        return $definition->recordsRuns() && $this->recorder->enabled();
+    }
+
+    private function summary(AgentDefinition $definition, AgentOutcome $outcome): string
+    {
+        return RunSummary::render($definition->domainLabel(), $definition->summaryTemplate(), $definition->summaryCounts($outcome));
     }
 
     private function recordRunStep(?Run $run, Step $step): void

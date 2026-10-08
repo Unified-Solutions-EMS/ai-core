@@ -16,8 +16,17 @@ Shared AI platform for Unified Solutions apps. OpenAI only (the vendor covered b
 
 ```bash
 composer require unified/ai-core
-php artisan vendor:publish --tag=ai-migrations   # only if the app records runs or proposals
+php artisan vendor:publish --tag=ai-migrations
 php artisan migrate
+```
+
+**Publish and run the migrations.** Run recording is on by default (`AgentDefinition::recordsRuns()` returns true and `ai.ledger.enabled` is true), and a recording agent fails on its first turn without the `ai_runs` and `ai_run_steps` tables. Proposals need `ai_proposals`. The only app that can skip the migrations is one where every definition returns `recordsRuns() === false` and nothing uses `ProposalService`.
+
+Schedule the housekeeping commands:
+
+```php
+Schedule::command('ai:recover-stuck-proposals')->everyFiveMinutes();
+Schedule::command('ai:prune-runs')->daily();
 ```
 
 Apps install from the GitHub repo (`Unified-Solutions-EMS/ai-core`), like sso-client. `composer.lock` must reference the GitHub dist, never a path repository.
@@ -53,16 +62,21 @@ class DispatchAgent extends AgentDefinition
     public function tools(AgentContext $c): array { return [$this->candidates, $this->assign]; }
 }
 
-$outcome = app(Agent::class)->run($definition, $context, $input, $conversation, $emit, planMode: true);
+$outcome = app(Agent::class)->run($definition, $context, $input, $conversation, $emit);
 $proposal = app(ProposalService::class)->draft('cad.dispatch', $outcome->plan('Assign units'), $companyId, $userId, $outcome->run);
 ```
 
 - `Tool::execute(array $args, AgentContext $context): ToolResult`. `payload` goes to the model, `ui` to the browser. Throw `ToolFailure` for a message the model should read and correct.
-- A tool that writes implements `WriteTool` (and optionally `DescribesChange`). In plan mode it is recorded as a `PlannedChange` and never executed.
+- A tool that writes implements `WriteTool` (and optionally `DescribesChange`). By default it is never executed: the call is recorded as a `PlannedChange` for a proposal. An agent that must write directly overrides `allowDirectWrites()` to return true; even then `planMode: true` or a replay keeps writes planned, and running such an agent with `proposal:` throws. A run that wrote directly cannot be drafted into a proposal.
+- Daily token cap: summed from the run ledger (replays excluded). A definition that does not record runs must implement `TracksTokenSpend` or set `dailyTokenCap()` to 0; otherwise `Agent::run()` throws a `LogicException` before sending anything. Call `Agent::assertRunnable($definition, $context)` in a test or at boot to catch it earlier.
 - `ConversationStore` is how an app keeps chat history in its own tables; `InMemoryConversation` serves one-shot agents.
 - Emitted events: `tool_call {name, label}`, `tool_result {name, ok, …ui}`, `message {content}`, `error {message}`.
 
 ## Approval
+
+Every transition (refine, approve, reject, verify, execute) is a compare-and-set on the status the caller loaded, plus the plan hash for refine, approve and execute. The losing request gets `ProposalStateChanged` and writes nothing. Refining, rejecting or verifying while a proposal is being applied throws `ProposalStateException` (map both to HTTP 409), and abandoned-cleanup purge hooks never run against an executing row. The execution claim requires `plan_hash = approved_plan_hash` = the hash of the plan being run in the same conditional update; if the plan no longer matches, the proposal goes back to `refined` for a fresh approval.
+
+**Executors must be idempotent per change.** A worker that dies mid-execution (timeout, out of memory, deploy) leaves the row `executing`. `ai:recover-stuck-proposals --minutes=30` (or `Proposal::isStale()` + `ProposalService::markStuck()`) moves it to `failed` with a reason, and a person may then retry changes that were already applied. `execute(..., executedBy: $userId)` records who started it in `executing_by`; `executing_at` is the claim time.
 
 ```php
 $service->approve($proposal, $userId, 'Approve and apply', $hashShownOnTheButton);
@@ -74,7 +88,9 @@ The plan hash is taken over canonical JSON (keys sorted at every depth, whole fl
 
 ## Run index and SOPs
 
-`RegisterRunWithSso` posts `{app_slug, domain, run_id, company_sso_id, sop_version_id, summary, outcome, approved_by_sso_id, created_at}` to `{SSO}/api/internal/ai-runs/register`. One try, failures logged and swallowed, a 404 logged at debug. Keep `AgentDefinition::indexSummary()` free of PHI.
+`RegisterRunWithSso` posts `{app_slug, domain, run_id, company_sso_id, sop_version_id, summary, outcome, approved_by_sso_id, created_at}` to `{SSO}/api/internal/ai-runs/register`. One try, failures logged and swallowed, a 404 logged at debug.
+
+`summary` is built by the package (`RunSummary`), never passed as free text. A definition supplies `domainLabel()` ("CAD dispatch"), `summaryTemplate()` with integer placeholders only (`'{trips} trips, {assigned} assigned, {unassignable} unassignable'`) and `summaryCounts()` (`['trips' => 3, …]`). The index line reads `CAD dispatch: 3 trips, 3 assigned, 0 unassignable, approved`. Labels and templates outside letters, digits, spaces and `, . ; : ( ) / _ -` are refused before the run starts.
 
 `Sops::active()` reads `{SSO}/api/internal/sops/{company}/{domain}/active`. Call `Sops::forget()` from the `sop.activated` webhook handler.
 
@@ -99,4 +115,4 @@ composer lint      # pint
 composer analyse   # larastan level 5
 ```
 
-`ai:prune-runs --days=365` deletes old ledger rows.
+`ai:prune-runs --days=365` deletes old ledger rows and finished proposals (executed, verified, rejected, failed), running each proposal's purge hooks first. Open proposals are never pruned.
