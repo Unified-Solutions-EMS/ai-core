@@ -13,7 +13,10 @@ use Unified\AiCore\Ledger\RunRecorder;
 use Unified\AiCore\Phi\PurgeHooks;
 use Unified\AiCore\Proposal\ProposalService;
 use Unified\AiCore\Sop\SopClient;
+use Unified\AiCore\Usage\SsoClientUsageRecorder;
 use Unified\AiCore\Usage\TokenBudget;
+use Unified\AiCore\Usage\UsageRecorder;
+use Unified\AiCore\Usage\UsageScope;
 
 class AiCoreServiceProvider extends ServiceProvider
 {
@@ -25,6 +28,9 @@ class AiCoreServiceProvider extends ServiceProvider
         $this->app->singleton(SopClient::class);
         $this->app->singleton(TokenBudget::class);
         $this->app->singleton(PurgeHooks::class);
+        $this->app->singleton(UsageRecorder::class, SsoClientUsageRecorder::class);
+        // Scoped, not singleton: reset between Octane requests and queued jobs.
+        $this->app->scoped(UsageScope::class);
         $this->app->bind(RunRecorder::class);
         $this->app->bind(Agent::class);
         $this->app->bind(ProposalService::class);

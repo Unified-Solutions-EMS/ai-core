@@ -11,6 +11,7 @@ Shared AI platform for Unified Solutions apps. OpenAI only (the vendor covered b
 | `Replay` | `ReplayableAgent` + `ReplaysWithAgent` + `DryRunContext` for "test this SOP against a past run" |
 | `Sop` | `Sops::active($domain, $companySsoId)` from SSO (cached 5 min) and the fixed `SopFrame` |
 | `Phi` | `PhiPosture`, `ModelDisclosure`, `PurgeHooks` |
+| `Usage` | One `ai.request` usage metric per model call (`UsageScope`, `UsageRecorder`), plus the daily `TokenBudget` |
 
 ## Install
 
@@ -47,6 +48,7 @@ No new environment variables are required. `config/ai.php` reads the names apps 
 | `ai.app_slug` | `AI_APP_SLUG`, then `sso.app_slug`, then `metrics.app_key` |
 | `ai.token_caps` | `['default' => AI_DAILY_TOKEN_CAP, 'cad.dispatch' => …]`, keyed by domain |
 | `ai.phi.posture` | `AI_PHI_POSTURE`, then `CHAT_PHI_POSTURE` |
+| `ai.usage.enabled` | `AI_USAGE_ENABLED` (unset = on, except while running unit tests) |
 
 Apps that need `HasCompanyScope` on `ai_runs` / `ai_proposals` extend `Ledger\Run` / `Proposal\Proposal` and point `ai.models.run` / `ai.models.proposal` at the subclass.
 
@@ -71,6 +73,29 @@ $proposal = app(ProposalService::class)->draft('cad.dispatch', $outcome->plan('A
 - Daily token cap: summed from the run ledger (replays excluded). A definition that does not record runs must implement `TracksTokenSpend` or set `dailyTokenCap()` to 0; otherwise `Agent::run()` throws a `LogicException` before sending anything. Call `Agent::assertRunnable($definition, $context)` in a test or at boot to catch it earlier.
 - `ConversationStore` is how an app keeps chat history in its own tables; `InMemoryConversation` serves one-shot agents.
 - Emitted events: `tool_call {name, label}`, `tool_result {name, ok, …ui}`, `message {content}`, `error {message}`.
+
+## Usage metrics
+
+Every call `OpenAiClient` makes to the vendor records exactly one `UsageSample` (the `ai.request` metric): feature, purpose (`chat`, `extraction`, `transcription`, `captions`), model as returned by the vendor, input/output/cached tokens, Whisper audio seconds, duration, and outcome (`ok`, `error`, `timeout`, `busy`, `rejected`, `refused`). Failures are recorded too; a call refused because no key is configured never left the process and is not. No prompt text, transcript or file name is ever in a sample. `transcribeChunks()` records one sample per chunk.
+
+The bound `UsageRecorder` (singleton, default `SsoClientUsageRecorder`) forwards to sso-client's `Unified\SsoClient\Metrics\AiUsage::record()`, which handles SSO id translation and queueing. Without sso-client installed it does nothing; an app without sso-client (SSO itself) binds its own recorder. Recording is best-effort: a recorder that throws never reaches the caller. It is off while running unit tests unless a test sets `config(['ai.usage.enabled' => true])`; bind a spy `UsageRecorder` to assert on samples.
+
+**Agent runs are automatic.** `Agent::run()` (and so replays) scopes every model call in the run: feature = `AgentDefinition::usageFeature()` (the domain with dots as dashes, `cad.dispatch` becomes `cad-dispatch`; override it to name the product feature, e.g. `trip-assignment`), and `local_company_id` / `local_user_id` / `sso_company_id` from the context. A scope the caller already set wins for `feature` and `surface`; the context wins for ids it has.
+
+**Direct calls need a scope**, or they are recorded as `unscoped-{purpose}`:
+
+```php
+use Unified\AiCore\Usage\UsageScope;
+
+$explanation = UsageScope::within([
+    'feature' => 'run-explain',          // [a-z0-9_-], at most 40 characters
+    'local_company_id' => $companyId,
+    'local_user_id' => $userId,
+    'surface' => 'web',                  // web | mobile | api | queue
+], fn () => $client->respond($input, $format));
+```
+
+Allowed keys: `feature`, `local_company_id`, `local_user_id`, `sso_company_id`, `sso_user_id`, `surface` (anything else throws). `within()` layers onto the current scope and restores it on exit, exception or not. A job or controller can instead call `UsageScope::set([...])` once at its boundary; the scope is bound as `scoped`, so it resets between Octane requests and queued jobs.
 
 ## Approval
 
