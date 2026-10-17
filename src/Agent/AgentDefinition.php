@@ -21,6 +21,17 @@ abstract class AgentDefinition
      */
     abstract public function domain(): string;
 
+    /**
+     * Feature key for the `ai.request` usage metric ([a-z0-9_-], at most
+     * 40 characters). Defaults to the domain with dots as dashes
+     * ("cad.dispatch" becomes "cad-dispatch"); override to give the
+     * product feature its stable name ("trip-assignment").
+     */
+    public function usageFeature(): string
+    {
+        return str_replace('.', '-', $this->domain());
+    }
+
     abstract public function systemPrompt(AgentContext $context): string;
 
     /**

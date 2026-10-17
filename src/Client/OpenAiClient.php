@@ -9,6 +9,11 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
+use Throwable;
+use Unified\AiCore\Usage\CallUsage;
+use Unified\AiCore\Usage\UsageRecorder;
+use Unified\AiCore\Usage\UsageSample;
+use Unified\AiCore\Usage\UsageScope;
 
 /**
  * The platform's one client for the model vendor (OpenAI, under the
@@ -21,6 +26,13 @@ use Illuminate\Support\Facades\Storage;
  *
  * Fails closed: with no API key isConfigured() is false and every call
  * throws AiException::notConfigured() instead of sending anything.
+ *
+ * Every call that reaches the vendor records exactly one UsageSample
+ * (the `ai.request` metric) through the bound UsageRecorder: on success
+ * and on every failure, with the purpose, model, tokens, audio seconds,
+ * duration and outcome, stamped with the current UsageScope. Recording
+ * is best-effort and never throws into the caller. A call refused for
+ * want of configuration never left the process and is not recorded.
  */
 class OpenAiClient
 {
@@ -69,9 +81,20 @@ class OpenAiClient
             $body['reasoning_effort'] = $effort;
         }
 
-        $response = $this->send(fn (PendingRequest $http): Response => $http->asJson()->post($this->url('chat/completions'), $body));
+        return $this->metered(self::PURPOSE_CHAT, $model, function (CallUsage $usage) use ($body, $model): ChatCompletion {
+            $response = $this->timedSend($usage, fn (PendingRequest $http): Response => $http->asJson()->post($this->url('chat/completions'), $body));
 
-        return ChatCompletion::fromResponse($response->json() ?? [], $model);
+            /** @var array<string, mixed> $json */
+            $json = $response->json() ?? [];
+            $completion = ChatCompletion::fromResponse($json, $model);
+
+            $usage->model = $completion->model;
+            $usage->inputTokens = $completion->promptTokens;
+            $usage->outputTokens = $completion->completionTokens;
+            $usage->cachedTokens = (int) ($json['usage']['prompt_tokens_details']['cached_tokens'] ?? 0);
+
+            return $completion;
+        });
     }
 
     /**
@@ -92,7 +115,44 @@ class OpenAiClient
         array $options = [],
     ): StructuredResponse {
         $model ??= $this->model(self::PURPOSE_EXTRACTION);
+        $body = $this->responsesBody($input, $format, $instructions, $model, $reasoningEffort, $options);
 
+        return $this->metered(
+            self::PURPOSE_EXTRACTION,
+            $model,
+            fn (CallUsage $usage): StructuredResponse => $this->sendResponses($usage, $body, $model, $timeoutSeconds),
+        );
+    }
+
+    /**
+     * Strict structured output in one call: returns the decoded object.
+     *
+     * @param  array<string, mixed>  $schema
+     * @param  list<array<string, mixed>>|string  $input
+     * @return array<string, mixed>
+     */
+    public function extract(string $schemaName, array $schema, array|string $input, ?string $instructions = null, ?string $model = null, ?int $timeoutSeconds = null): array
+    {
+        $model ??= $this->model(self::PURPOSE_EXTRACTION);
+        $body = $this->responsesBody($input, JsonSchema::format($schemaName, $schema), $instructions, $model, null, []);
+
+        // data() runs inside the metered call so an unreadable reply is
+        // recorded as a failure rather than a success.
+        return $this->metered(
+            self::PURPOSE_EXTRACTION,
+            $model,
+            fn (CallUsage $usage): array => $this->sendResponses($usage, $body, $model, $timeoutSeconds)->data(),
+        );
+    }
+
+    /**
+     * @param  list<array<string, mixed>>|string  $input
+     * @param  array<string, mixed>|null  $format
+     * @param  array<string, mixed>  $options
+     * @return array<string, mixed>
+     */
+    private function responsesBody(array|string $input, ?array $format, ?string $instructions, string $model, ?string $reasoningEffort, array $options): array
+    {
         $body = ['model' => $model, 'input' => $input, ...$options];
 
         if ($instructions !== null) {
@@ -107,13 +167,27 @@ class OpenAiClient
             $body['reasoning'] = ['effort' => $reasoningEffort];
         }
 
-        $response = $this->send(
+        return $body;
+    }
+
+    /**
+     * @param  array<string, mixed>  $body
+     */
+    private function sendResponses(CallUsage $usage, array $body, string $model, ?int $timeoutSeconds): StructuredResponse
+    {
+        $response = $this->timedSend(
+            $usage,
             fn (PendingRequest $http): Response => $http->asJson()->post($this->url('responses'), $body),
             $timeoutSeconds,
         );
 
         /** @var array<string, mixed> $reply */
         $reply = $response->json() ?? [];
+
+        $usage->model = is_string($reply['model'] ?? null) ? $reply['model'] : $model;
+        $usage->inputTokens = (int) ($reply['usage']['input_tokens'] ?? 0);
+        $usage->outputTokens = (int) ($reply['usage']['output_tokens'] ?? 0);
+        $usage->cachedTokens = (int) ($reply['usage']['input_tokens_details']['cached_tokens'] ?? 0);
 
         foreach ($this->contentParts($reply) as $part) {
             if (($part['type'] ?? null) === 'refusal') {
@@ -139,28 +213,10 @@ class OpenAiClient
 
         return new StructuredResponse(
             text: $text,
-            inputTokens: (int) ($reply['usage']['input_tokens'] ?? 0),
-            outputTokens: (int) ($reply['usage']['output_tokens'] ?? 0),
-            model: is_string($reply['model'] ?? null) ? $reply['model'] : $model,
+            inputTokens: $usage->inputTokens,
+            outputTokens: $usage->outputTokens,
+            model: $usage->model,
         );
-    }
-
-    /**
-     * Strict structured output in one call: returns the decoded object.
-     *
-     * @param  array<string, mixed>  $schema
-     * @param  list<array<string, mixed>>|string  $input
-     * @return array<string, mixed>
-     */
-    public function extract(string $schemaName, array $schema, array|string $input, ?string $instructions = null, ?string $model = null, ?int $timeoutSeconds = null): array
-    {
-        return $this->respond(
-            input: $input,
-            format: JsonSchema::format($schemaName, $schema),
-            instructions: $instructions,
-            model: $model,
-            timeoutSeconds: $timeoutSeconds,
-        )->data();
     }
 
     /**
@@ -182,30 +238,36 @@ class OpenAiClient
             'prompt' => $prompt,
         ], fn (?string $value): bool => $value !== null && $value !== '');
 
-        $response = $this->send(function (PendingRequest $http) use ($filePath, $fields): Response {
-            $handle = fopen($filePath, 'r');
+        return $this->metered(self::PURPOSE_TRANSCRIPTION, $model, function (CallUsage $usage) use ($filePath, $fields, $model): Transcript {
+            $response = $this->timedSend($usage, function (PendingRequest $http) use ($filePath, $fields): Response {
+                $handle = fopen($filePath, 'r');
 
-            try {
-                return $http->attach('file', $handle, basename($filePath))->post($this->url('audio/transcriptions'), $fields);
-            } finally {
-                if (is_resource($handle)) {
-                    fclose($handle);
+                try {
+                    return $http->attach('file', $handle, basename($filePath))->post($this->url('audio/transcriptions'), $fields);
+                } finally {
+                    if (is_resource($handle)) {
+                        fclose($handle);
+                    }
                 }
+            });
+
+            $json = $response->json();
+
+            if (! is_array($json)) {
+                return new Transcript(trim($response->body()), [], $model);
             }
+
+            $transcript = new Transcript(
+                text: trim((string) ($json['text'] ?? '')),
+                segments: array_values(array_filter((array) ($json['segments'] ?? []), 'is_array')),
+                model: $model,
+                duration: isset($json['duration']) ? (float) $json['duration'] : null,
+            );
+
+            $usage->audioSeconds = $transcript->duration;
+
+            return $transcript;
         });
-
-        $json = $response->json();
-
-        if (! is_array($json)) {
-            return new Transcript(trim($response->body()), [], $model);
-        }
-
-        return new Transcript(
-            text: trim((string) ($json['text'] ?? '')),
-            segments: array_values(array_filter((array) ($json['segments'] ?? []), 'is_array')),
-            model: $model,
-            duration: isset($json['duration']) ? (float) $json['duration'] : null,
-        );
     }
 
     /**
@@ -294,18 +356,113 @@ class OpenAiClient
             ],
         ];
 
+        $model = $session['audio']['input']['transcription']['model'] ?? null;
+        $model = is_string($model) && $model !== '' ? $model : $this->model(self::PURPOSE_CAPTIONS);
+
         try {
-            $response = $this->send(
-                fn (PendingRequest $http): Response => $http->asJson()->post($this->url('realtime/client_secrets'), ['session' => $session]),
-                8,
-            );
+            return $this->metered(self::PURPOSE_CAPTIONS, $model, function (CallUsage $usage) use ($session): string {
+                $response = $this->timedSend(
+                    $usage,
+                    fn (PendingRequest $http): Response => $http->asJson()->post($this->url('realtime/client_secrets'), ['session' => $session]),
+                    8,
+                );
+
+                $secret = $response->json('value');
+
+                return is_string($secret) && $secret !== '' ? $secret : throw AiException::unreadable('no client secret in reply');
+            });
         } catch (AiException) {
             return null;
         }
+    }
 
-        $secret = $response->json('value');
+    /**
+     * Run one vendor call and record its usage sample, whatever happens.
+     *
+     * @template T
+     *
+     * @param  callable(CallUsage): T  $call
+     * @return T
+     */
+    private function metered(string $purpose, string $model, callable $call): mixed
+    {
+        $usage = new CallUsage($purpose, $model);
 
-        return is_string($secret) && $secret !== '' ? $secret : null;
+        try {
+            $result = $call($usage);
+        } catch (AiException $e) {
+            if ($e->reason !== AiException::NOT_CONFIGURED) {
+                $this->recordUsage($usage, self::outcomeFor($e));
+            }
+
+            throw $e;
+        } catch (Throwable $e) {
+            if ($usage->durationMs !== null) {
+                $this->recordUsage($usage, UsageSample::OUTCOME_ERROR);
+            }
+
+            throw $e;
+        }
+
+        $this->recordUsage($usage, UsageSample::OUTCOME_OK);
+
+        return $result;
+    }
+
+    /**
+     * @param  callable(PendingRequest): Response  $call
+     */
+    private function timedSend(CallUsage $usage, callable $call, ?int $timeoutSeconds = null): Response
+    {
+        $started = hrtime(true);
+
+        try {
+            return $this->send($call, $timeoutSeconds);
+        } finally {
+            $usage->durationMs = (int) round((hrtime(true) - $started) / 1_000_000);
+        }
+    }
+
+    private static function outcomeFor(AiException $e): string
+    {
+        return match ($e->reason) {
+            AiException::TIMED_OUT => UsageSample::OUTCOME_TIMEOUT,
+            AiException::BUSY => UsageSample::OUTCOME_BUSY,
+            AiException::REJECTED => UsageSample::OUTCOME_REJECTED,
+            AiException::REFUSED => UsageSample::OUTCOME_REFUSED,
+            default => UsageSample::OUTCOME_ERROR,
+        };
+    }
+
+    private function recordUsage(CallUsage $usage, string $outcome): void
+    {
+        try {
+            if (! self::usageEnabled()) {
+                return;
+            }
+
+            app(UsageRecorder::class)->record($usage->toSample($outcome, UsageScope::current()));
+        } catch (Throwable) {
+            // Metrics are best-effort: a recorder failure must never fail
+            // (or slow down) the AI call the user is waiting on.
+        }
+    }
+
+    /**
+     * Null (the default) means on everywhere except while running unit
+     * tests, where every call would otherwise queue a metric send from
+     * inside app test suites. Tests of the pipeline opt back in with
+     * config(['ai.usage.enabled' => true]).
+     */
+    public static function usageEnabled(): bool
+    {
+        $enabled = config('ai.usage.enabled');
+
+        if ($enabled !== null) {
+            return (bool) $enabled;
+        }
+
+        return ! app()->runningUnitTests();
     }
 
     /**

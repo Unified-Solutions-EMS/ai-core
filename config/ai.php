@@ -60,6 +60,16 @@ return [
         'reasoning_effort' => env('OPENAI_REASONING_EFFORT', 'none'),
     ],
 
+    /*
+    | One `ai.request` usage metric per model call (feature, model, tokens,
+    | duration, outcome; never prompt text), forwarded to sso-client's
+    | AiUsage when installed. Null means on everywhere except while
+    | running unit tests; true or false forces it.
+    */
+    'usage' => [
+        'enabled' => env('AI_USAGE_ENABLED'),
+    ],
+
     'agent' => [
         // Tool-call round trips per user message before the turn gives up.
         'max_iterations' => (int) env('AI_MAX_TOOL_ITERATIONS', 10),

@@ -20,6 +20,7 @@ use Unified\AiCore\Sop\SopFrame;
 use Unified\AiCore\Sop\SopVersion;
 use Unified\AiCore\Support\SsoEndpoint;
 use Unified\AiCore\Usage\TokenBudget;
+use Unified\AiCore\Usage\UsageScope;
 
 /**
  * The agentic loop: send the conversation and tool definitions to the
@@ -38,6 +39,16 @@ use Unified\AiCore\Usage\TokenBudget;
  * PlannedChange on the outcome. Only a definition that returns true from
  * allowDirectWrites() runs them, and never in plan mode, in a replay
  * (DryRunContext) or while refining a Proposal.
+ *
+ * Usage metrics: every model call in a run is recorded under a
+ * UsageScope built from the definition and the context: feature =
+ * AgentDefinition::usageFeature() (the domain with dots as dashes),
+ * local_company_id / local_user_id / sso_company_id from the context.
+ * Precedence: a scope the caller already set wins for `feature` and
+ * `surface` (so an app can name the feature or mark a queued run), while
+ * the context wins for company and user ids whenever it has them (it is
+ * the authoritative tenant for the run). The previous scope is restored
+ * when the run ends.
  */
 class Agent
 {
@@ -59,6 +70,43 @@ class Agent
         ?callable $emit = null,
         bool $planMode = false,
         ?Proposal $proposal = null,
+    ): AgentOutcome {
+        return UsageScope::within(
+            $this->usageScope($definition, $context),
+            fn (): AgentOutcome => $this->runScoped($definition, $context, $input, $conversation, $emit, $planMode, $proposal),
+        );
+    }
+
+    /**
+     * @return array<string, int|string|null>
+     */
+    private function usageScope(AgentDefinition $definition, AgentContext $context): array
+    {
+        $outer = UsageScope::current();
+
+        $scope = [
+            'feature' => $outer['feature'] ?? $definition->usageFeature(),
+            'local_company_id' => $context->companyId(),
+            'local_user_id' => $context->userId(),
+            'sso_company_id' => $context->companySsoId(),
+        ];
+
+        // within() layers onto the outer scope, so an outer surface (and
+        // any outer id the context lacks) carries through untouched.
+        return array_filter($scope, fn (int|string|null $value): bool => $value !== null);
+    }
+
+    /**
+     * @param  (callable(array<string, mixed>): void)|null  $emit
+     */
+    private function runScoped(
+        AgentDefinition $definition,
+        AgentContext $context,
+        string $input,
+        ?ConversationStore $conversation,
+        ?callable $emit,
+        bool $planMode,
+        ?Proposal $proposal,
     ): AgentOutcome {
         $this->assertRunnable($definition, $context, $proposal);
 
