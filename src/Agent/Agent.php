@@ -162,6 +162,10 @@ class Agent
 
         try {
             for ($iteration = 0; $iteration < $definition->maxIterations(); $iteration++) {
+                if ($iteration > 0 && $definition instanceof RefreshesTools) {
+                    $tools = $this->indexTools($definition->tools($toolContext));
+                }
+
                 $completion = $this->client->chat(
                     messages: $messages,
                     tools: $this->toolDefinitions($tools),

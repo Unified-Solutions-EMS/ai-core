@@ -25,6 +25,7 @@ use Unified\AiCore\Proposal\Plan;
 use Unified\AiCore\Proposal\ProposalService;
 use Unified\AiCore\Testing\OpenAiFake;
 use Unified\AiCore\Tests\Fixtures\EchoTool;
+use Unified\AiCore\Tests\Fixtures\LoadsToolsDefinition;
 use Unified\AiCore\Tests\Fixtures\SpendTrackingDefinition;
 use Unified\AiCore\Tests\Fixtures\TestContext;
 use Unified\AiCore\Tests\Fixtures\TestDefinition;
@@ -120,6 +121,56 @@ class AgentTest extends TestCase
         $this->assertSame(['text' => 'hello'], $steps[2]->arguments);
         $this->assertSame(['echo' => 'hello'], $steps[2]->result);
         $this->assertSame([1, 2, 3, 4, 5], $steps->pluck('seq')->all());
+    }
+
+    public function test_a_definition_that_refreshes_tools_offers_tools_loaded_by_an_earlier_call(): void
+    {
+        $definition = new LoadsToolsDefinition;
+        $definition->directWrites = true;
+        OpenAiFake::chat([
+            OpenAiFake::toolCalls(['c1' => ['echo', ['text' => 'load']]]),
+            OpenAiFake::toolCalls(['c2' => ['assign_unit', ['trip' => 4, 'unit' => 'M4']]]),
+            OpenAiFake::message('done'),
+        ]);
+
+        $outcome = $this->runAgent($definition);
+
+        $this->assertTrue($outcome->answered());
+        $this->assertSame(1, $definition->assign->executed);
+        $this->assertSame(3, $definition->toolReads);
+
+        $sent = array_map(
+            fn (array $body): array => array_map(fn (array $tool): string => $tool['function']['name'], $body['tools'] ?? []),
+            OpenAiFake::sentChatBodies(),
+        );
+        $this->assertSame([['echo'], ['echo', 'assign_unit'], ['echo', 'assign_unit']], $sent);
+    }
+
+    public function test_a_definition_without_the_marker_reads_its_tools_once(): void
+    {
+        $definition = new class extends TestDefinition
+        {
+            public int $toolReads = 0;
+
+            public function tools(AgentContext $context): array
+            {
+                $this->toolReads++;
+
+                return $this->echo->calls === [] ? [$this->echo] : [$this->echo, $this->assign];
+            }
+        };
+        $definition->directWrites = true;
+        OpenAiFake::chat([
+            OpenAiFake::toolCalls(['c1' => ['echo', ['text' => 'load']]]),
+            OpenAiFake::toolCalls(['c2' => ['assign_unit', ['trip' => 4, 'unit' => 'M4']]]),
+            OpenAiFake::message('done'),
+        ]);
+
+        $this->runAgent($definition);
+
+        $this->assertSame(1, $definition->toolReads);
+        $this->assertSame(0, $definition->assign->executed);
+        $this->assertSame('{"error":"Unknown tool \'assign_unit\'."}', OpenAiFake::sentChatBodies()[2]['messages'][5]['content']);
     }
 
     public function test_tool_failures_become_model_readable_errors(): void
