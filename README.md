@@ -70,6 +70,7 @@ $proposal = app(ProposalService::class)->draft('cad.dispatch', $outcome->plan('A
 
 - `Tool::execute(array $args, AgentContext $context): ToolResult`. `payload` goes to the model, `ui` to the browser. Throw `ToolFailure` for a message the model should read and correct.
 - A tool that writes implements `WriteTool` (and optionally `DescribesChange`). By default it is never executed: the call is recorded as a `PlannedChange` for a proposal. An agent that must write directly overrides `allowDirectWrites()` to return true; even then `planMode: true` or a replay keeps writes planned, and running such an agent with `proposal:` throws. A run that wrote directly cannot be drafted into a proposal.
+- `tools()` is read once per run. A definition whose tool list can grow during a run (a tool that loads more tools) implements the `RefreshesTools` marker, and the loop re-reads `tools()` before every model call after the first.
 - Daily token cap: summed from the run ledger (replays excluded). A definition that does not record runs must implement `TracksTokenSpend` or set `dailyTokenCap()` to 0; otherwise `Agent::run()` throws a `LogicException` before sending anything. Call `Agent::assertRunnable($definition, $context)` in a test or at boot to catch it earlier.
 - `ConversationStore` is how an app keeps chat history in its own tables; `InMemoryConversation` serves one-shot agents.
 - Emitted events: `tool_call {name, label}`, `tool_result {name, ok, …ui}`, `message {content}`, `error {message}`.
